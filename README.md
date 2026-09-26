@@ -1,6 +1,7 @@
 
 # 26/09 Latest Update: Various New Functions
 * Streamlined Qwen VL encoder and many QoL nodes
+* New conditioning merge methods
 * Minor needed fixes for the encode nodes
 
 # 10/08 Prompt-based Omni Node in ComfyUI
