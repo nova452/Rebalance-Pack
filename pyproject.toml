@@ -2,14 +2,14 @@
 name = "ComfyUI-Conditioning-Rebalance"
 description = """A set of evolving nodes that balance ComfyUI for the best user experience.
 
-foundational: Omni Node, Input, Load Images, Color Image, Concatenate, String (Inline), Any, Switch
+foundational: Omni Node, Input, Load Images, Load Image Newest, Load Image Full, Color Image, Concatenate, String (Inline), String to List, List String Index, Float Exact, Float 1.00, Float 10.00, Any, Switch
 
 utility: Image Resolution Cap, Image Aspect Ratio Crop, Mask Aspect Ratio Crop, Mask Uncrop, Image Uncrop, Border Mask, Mask Opacity,
 
-conditioning: Conditioning Merge, Conditioning Merge Multi
+conditioning: Conditioning Merge, Conditioning Merge Multi, Qwen VL List Encode Rebalance, Conditioning Freeze, Conditioning Unfreeze
 
 model specific: Load LoRA (Block), Conditioning Krea 2 Rebalance, Krea 2 Edit Rebalance, Krea 2 Encode Rebalance, Conditioning Ideogram 4 Rebalance, Ideogram 4 Edit Rebalance, Ideogram 4 Encode Rebalance"""
-version = "2.1.0"
+version = "2.3.0"
 license = { file = "LICENSE.txt" }
 
 
