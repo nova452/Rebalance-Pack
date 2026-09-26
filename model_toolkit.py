@@ -1,14 +1,20 @@
 """Rebalance-Pack model toolkit.
 
-    model_toolkit.py        -> LoraLoaderBlock (per-block LoRA weight control)
-
 """
 
+import math
 import re
+
+import torch
+import torch.nn.functional as F
 
 import folder_paths
 import comfy.utils
 import comfy.lora
+import comfy.lora_convert
+import comfy.sd
+
+from .conditioning_rebalance import merge_conditioning_mode
 
 
 # SDXL block groups, in the same order as ModelMergeSDXL.
@@ -179,3 +185,4 @@ __all__ = [
     "NODE_CLASS_MAPPINGS",
     "NODE_DISPLAY_NAME_MAPPINGS",
 ]
+

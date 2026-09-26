@@ -80,7 +80,16 @@ def _register_file_list_route():
             logging.exception("Rebalance-Pack: failed to register /rebalance_pack/list_files route")
 
 
+# Register the route eagerly at import time. Custom node modules are loaded
+# before the aiohttp router is frozen, so this is safe and guarantees the
+# endpoint exists for the ListDisplay frontend.
 _register_file_list_route()
+
+
+# ---------------------------------------------------------------------------
+# Server route: list files in a directory filtered by extension.
+# Registered lazily so the combo widget's `remote` option can fetch a fresh
+# list (with a refresh button) the same way ComfyUI's built-in Load LoRA does.
 
 
 VALID_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.tga')
@@ -94,14 +103,7 @@ def _resolve_directory_path(directory_path):
 
 
 def _collect_image_files(directory_path, subfolder_depth):
-    """Collect image files from *directory_path*.
 
-    ``subfolder_depth`` controls how deep we recurse:
-        0  - only the top-level directory (no subfolders)
-        1  - top-level + immediate subfolders
-        N  - recurse up to N levels deep
-        -1 - unlimited recursion (all descendants)
-    """
     image_paths = []
     if subfolder_depth == 0:
         for file in os.listdir(directory_path):

@@ -137,15 +137,8 @@ class Ideogram4EditRebalance:
 
     @staticmethod
     def _image_signature(image):
-        """Cheap signature for caching: shape + a few sampled values."""
-        if image is None:
-            return ("none",)
-        if isinstance(image, list):
-            return ("list", len(image),
-                    tuple(img.shape for img in image if hasattr(img, "shape")))
-        if hasattr(image, "shape"):
-            return ("tensor", tuple(image.shape))
-        return ("unknown",)
+        """Signature for caching: shape + a hash of the pixels."""
+        return core.image_signature(image)
 
     @staticmethod
     def _list_index():
@@ -200,10 +193,12 @@ class Ideogram4EditRebalance:
 
         guidance_passes = []
 
+        # Bounded LRU + CLIP identity in the key (see Krea2EditRebalance).
         cache = getattr(self, "_pass_cache", None)
-        if cache is None:
-            cache = {}
+        if not isinstance(cache, core.PassCache):
+            cache = core.PassCache()
             self._pass_cache = cache
+        clip_sig = core.clip_signature(clip)
 
         for p in range(n_passes):
             pass_images = []
@@ -220,18 +215,19 @@ class Ideogram4EditRebalance:
             has_image = any(img is not None for img, _ in pass_images)
 
             key = (
+                clip_sig,
                 p,
                 tuple(self._image_signature(img) for img, _ in pass_images),
                 tuple(tier for _, tier in pass_images),
                 float(steering),
-                float(layer_multiplier), str(ml),
-                float(layer_multiplier), str(rl),
+                float(layer_multiplier), str(ml), str(rl),
                 bool(enable_step),
                 prompt, prompt_ref,
             )
 
-            if key in cache:
-                guidance_passes.append(cache[key])
+            cached = cache.get(key)
+            if cached is not None:
+                guidance_passes.append(cached)
                 continue
 
             cond_main = compile_edit_ideogram4(clip, prompt, pass_images if has_image else None)
@@ -241,7 +237,7 @@ class Ideogram4EditRebalance:
             cond_ref = refocus(cond_ref, layer_multiplier, rl)
 
             pass_guidance = guidance(cond_main, cond_ref, steering)
-            cache[key] = pass_guidance
+            cache.put(key, pass_guidance)
             guidance_passes.append(pass_guidance)
 
         if not guidance_passes:

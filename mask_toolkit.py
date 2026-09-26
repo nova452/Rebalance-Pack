@@ -270,7 +270,7 @@ class MaskOpacity:
     """
     opacity = 1.0 keeps the mask unchanged (100% opacity).
     opacity = 0.0 makes the mask fully transparent (0% opacity).
-    Values in between linearly scale the mask intensity.
+    Values in between linearly scale the intensity.
     """
 
     def __init__(self):

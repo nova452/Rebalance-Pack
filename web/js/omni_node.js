@@ -8,7 +8,7 @@ const OMNI_NODE_API_NAME = "OmniNodeAPI";
 
 // Master switch for the OmniNode coloring/animation tweaks.
 // Set to false to completely disable the holo color overlay and animated background.
-const OMNI_COLOR_TWEAKS_ENABLED = true;
+const OMNI_COLOR_TWEAKS_ENABLED = false;
 
 function findAssignments(source) {
     const assigns = {};
