@@ -1,5 +1,9 @@
 
-# 10/08 Latest Update: Prompt-based Omni Node in ComfyUI
+# 26/09 Latest Update: Various New Functions
+* Streamlined Qwen VL encoder and many QoL nodes
+* Minor needed fixes for the encode nodes
+
+# 10/08 Prompt-based Omni Node in ComfyUI
 * Omni Node family extended
 * New core utility nodes
 <img width="2254" height="1176" alt="Screenshot (10)" src="https://github.com/user-attachments/assets/e01edd61-c064-42f2-81e7-a6463d8447f3" />
@@ -33,13 +37,13 @@ node class, rebuilding its own inputs/outputs to mirror the source.
 A set of evolving nodes that streamline the best use practices in ComfyUI.
 
 
-foundational: Omni Node, Input, Load Images, Concatenate (Multi), String (Inline), Any, Switch
+foundational: Omni Node, Input, Load Images, Load Image Newest, Load Image Full, Color Image, Concatenate, String (Inline), String to List, List String Index, Float Exact, Float 1.00, Float 10.00, Any, Switch
 
-utility: Image Resolution Cap, Image Aspect Ratio Crop, Mask Aspect Ratio Crop, Mask Uncrop, Image Uncrop, Border Mask Detector, 
+utility: Image Resolution Cap, Image Aspect Ratio Crop, Mask Aspect Ratio Crop, Mask Uncrop, Image Uncrop, Border Mask, Mask Opacity,
 
-conditioning: Conditioning Merge, Conditioning Merge Multi
+conditioning: Conditioning Merge, Conditioning Merge Multi, Qwen VL List Encode Rebalance, Conditioning Freeze, Conditioning Unfreeze
 
-model specific: Conditioning Krea 2 Rebalance, Krea 2 Edit Rebalance, Krea 2 Encode Rebalance, Conditioning Ideogram 4 Rebalance, Ideogram 4 Edit Rebalance, Ideogram 4 Encode Rebalance
+model specific: Load LoRA (Block), Conditioning Krea 2 Rebalance, Krea 2 Edit Rebalance, Krea 2 Encode Rebalance, Conditioning Ideogram 4 Rebalance, Ideogram 4 Edit Rebalance, Ideogram 4 Encode Rebalance
 
 ```bash
 git clone https://github.com/nova452/Rebalance-Pack.git
