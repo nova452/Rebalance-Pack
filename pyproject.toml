@@ -13,7 +13,7 @@ sampling: Rebalance Guider, Rebalance Guider B, Rebalance CFG Custom, Step Rebal
 lora: Load LoRA (Block), Load LoRA Krea2 (Block), Load LoRA Moss Image (Block), Load LoRA H3 (Block), Load LoRA H3 Image (Block), Load LoRA Folder (Block), Load LoRA Folder Moss Image (Block), Load LoRA Folder H3 (Block), Load LoRA Folder H3 Image (Block)
 
 model specific: Conditioning Krea2 Rebalance, Krea 2 Image Edit Rebalance, Krea 2 Image Edit Rebalance Steering, Krea 2 Encode Rebalance, Conditioning Ideogram4 Rebalance, Ideogram 4 Image Edit Rebalance, Ideogram 4 Encode Rebalance"""
-version = "2.4.0"
+version = "2.4.4"
 license = { file = "LICENSE" }
 
 
