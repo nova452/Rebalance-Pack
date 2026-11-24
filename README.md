@@ -1,7 +1,7 @@
-# 24/11
-* New sampling nodes: Sigmas Rebalance and Sampler Rebalance
-* Block-weighted LoRA loaders for MOSS-Image and MiniMax H3 / H3 Image, plus folder loaders for each
-* New pack avatar
+# 24/11 Latest Update
+* New sampling nodes
+* Block-weighted LoRA loaders for MOSS-Image and MiniMax H3 / H3 Image
+* Omni Node moved to another repository.
 
 # 10/08
 * New core utility nodes
