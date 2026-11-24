@@ -24,6 +24,39 @@ const MODE_WIDGETS = {
     orthogonal: ["strength"],
 };
 
+// Qwen VL Image Embeds Merge: batch style reducers. Strength only applies
+// to a subset of modes; it is hidden for the rest.
+const QWEN_MERGE_NODES = ["QwenVLImageEmbedsMerge"];
+
+const QWEN_HIDEABLE_WIDGETS = ["strength", "harmonic_sign"];
+
+const QWEN_MODE_WIDGETS = {
+    mean: [],
+    median: [],
+    trimmed_mean: ["strength"],
+    consensus: ["strength"],
+    dominant: [],
+    spread: ["strength"],
+    centroid_dir: [],
+    average: [],
+    norm_average: [],
+    weighted: ["strength"],
+    norm_weighted: ["strength"],
+    add: [],
+    subtract: [],
+    max_magnitude: [],
+    min_magnitude: [],
+    top_match: ["strength"],
+    concat: [],
+    geometric_mean: [],
+    harmonic_mean: ["harmonic_sign"],
+    rms: [],
+    mode_stats: [],
+    pca_style: [],
+    outlier: ["strength"],
+    random: ["strength"],
+};
+
 function showWidget(w) {
     if (w._mergeOrigType != null) {
         w.type = w._mergeOrigType;
@@ -45,13 +78,16 @@ function hideWidget(w) {
 function applyModeVisibility(node) {
     if (!node || !node.widgets) return;
 
+    const isQwen = QWEN_MERGE_NODES.includes(node.comfyClass || node.constructor?.comfyClass || node.getTitle?.());
     const modeWidget = node.widgets.find((w) => w.name === "mode");
     const mode = modeWidget ? String(modeWidget.value) : "top_match";
-    const visible = new Set(MODE_WIDGETS[mode] || []);
+    const table = isQwen ? QWEN_MODE_WIDGETS : MODE_WIDGETS;
+    const hideable = isQwen ? QWEN_HIDEABLE_WIDGETS : HIDEABLE_WIDGETS;
+    const visible = new Set(table[mode] || []);
 
     let changed = false;
     for (const w of node.widgets) {
-        if (!HIDEABLE_WIDGETS.includes(w.name)) continue;
+        if (!hideable.includes(w.name)) continue;
         const shouldShow = visible.has(w.name);
         const isHidden = w.type === "hidden";
         if (shouldShow && isHidden) {
@@ -84,7 +120,7 @@ function hookModeWidget(node) {
 app.registerExtension({
     name: "Rebalance.ConditioningMergeMode",
     async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (!MERGE_NODES.includes(nodeData?.name)) return;
+        if (!MERGE_NODES.includes(nodeData?.name) && !QWEN_MERGE_NODES.includes(nodeData?.name)) return;
 
         const origOnNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {

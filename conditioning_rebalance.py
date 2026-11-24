@@ -185,6 +185,14 @@ class PassCache:
             self._data.pop(next(iter(self._data)))
 
 
+# Module-level encode cache: identical (clip, prompt, images, template,
+# positions) encodes return the cached conditioning instead of re-running the
+# encoder. This makes repeated queue runs deterministic — GPU kernels are
+# nondeterministic, so re-encoding the same input yields slightly different
+# hidden states each time. Entries hold CPU copies so VRAM is not pinned.
+_ENCODE_CACHE = PassCache(max_entries=256)
+
+
 def _align_prompt(text):
     if text is None:
         return ""
@@ -291,7 +299,741 @@ def _qwen_image_positions_ctx(clip, positions):
     return enter, exit_
 
 
-def compile_edit(clip, prompt, images_with_size=None, llama_template=None, fixed_res=None, image_positions=None):
+def _capture_image_spans(clip):
+    """Patch ``build_image_inputs`` during encoding to record image spans.
+
+    Returns ``(enter, exit_, spans)``. After ``exit_()`` runs, ``spans`` holds
+    a list of ``(start, size)`` tuples — one per image, in input order —
+    locating each image's token span inside the encoded sequence. No-op
+    (empty list) when the encoder isn't a Qwen-VL style model."""
+    spans = []
+    tr = None
+    try:
+        for m in clip.cond_stage_model.modules():
+            if hasattr(m, "build_image_inputs") and hasattr(m, "visual"):
+                tr = m
+                break
+    except AttributeError:
+        tr = None
+    if tr is None:
+        return (lambda: None), (lambda: None), spans
+
+    orig = tr.build_image_inputs
+
+    def patched(embeds, embeds_info):
+        for e in sorted([e for e in embeds_info if e.get("type") == "image"],
+                        key=lambda e: e["index"]):
+            spans.append((e["index"], e["size"]))
+        return orig(embeds, embeds_info)
+
+    def enter():
+        tr.build_image_inputs = patched
+
+    def exit_():
+        tr.build_image_inputs = orig
+
+    return enter, exit_, spans
+
+
+def _qwen_image_spans(conditioning):
+    """Read image spans recorded by ``_capture_image_spans`` from extras.
+
+    Returns a list of ``(start, size)`` tuples, or ``[]`` when the
+    conditioning carries no span info (e.g. plain text encode)."""
+    spans = []
+    for item in (conditioning or []):
+        if isinstance(item, (list, tuple)) and len(item) == 2 \
+                and isinstance(item[1], dict):
+            s = item[1].get("image_spans")
+            if isinstance(s, (list, tuple)):
+                spans.extend([tuple(x) for x in s])
+    return spans
+
+
+def _image_span_mask(seq_len, spans, device):
+    """Boolean mask ``(1, seq_len)`` marking image-token positions."""
+    m = torch.zeros((1, seq_len), dtype=torch.bool, device=device)
+    for start, size in spans:
+        start = max(0, int(start))
+        end = min(seq_len, start + max(0, int(size)))
+        if end > start:
+            m[0, start:end] = True
+    return m
+
+
+def _blend_image_spans(cond_a, cond_b, spans_a, spans_b, mode="average",
+                       strength=0.5, match_percent=0.5):
+    """Blend the image-token spans of two Qwen-VL conditionings.
+
+    Text tokens come from ``cond_a`` unchanged. Image tokens are blended
+    between the two encodings using the requested strategy, mirroring the
+    IPAdapter ``Combine Embeds`` methods but operating on the interleaved
+    image spans of a joint text+image sequence.
+
+    ``mode``:
+      average      element-wise mean of the two spans
+      norm_average energy-matched mean (neither image dominates by magnitude)
+      weighted     ``a * (1 - strength) + b * strength``
+      norm_weighted  energy-matched weighted blend
+      add          ``a + b``
+      subtract     ``a - b``
+      max_magnitude  keep the element with larger magnitude
+      min_magnitude  keep the element with smaller magnitude
+      top_match    average where both are strong and agree in sign,
+                   otherwise keep the dominant element (Rebalance default)
+      concat       interleave: keep both spans back to back (doubles the
+                   image token count; positions are not re-mapped, so this
+                   is best used with a single reference image)
+
+    Spans are blended per-position: each span of ``a`` is paired with the
+    same-index span of ``b`` (matched by order, truncated to the shorter
+    length). Batch dims are matched by broadcast/tiling first."""
+    orig_dtype = cond_a.dtype
+    a = cond_a.float()
+    b = cond_b.float()
+
+    target_batch = _common_batch([a, b])
+    a = _match_batch(a, target_batch)
+    b = _match_batch(b, target_batch)
+
+    out = a.clone()
+
+    n = min(len(spans_a), len(spans_b))
+    if n == 0:
+        # No span info on one side: fall back to blending the whole sequence.
+        blended = _merge_tensor_mode(a, b, mode, match_percent=match_percent,
+                                     strength=strength)
+        return blended.to(orig_dtype)
+
+    for i in range(n):
+        sa, sb = spans_a[i], spans_b[i]
+        start_a, size_a = int(sa[0]), int(sa[1])
+        start_b, size_b = int(sb[0]), int(sb[1])
+        size = min(size_a, size_b)
+        if size <= 0:
+            continue
+        seg_a = a[:, start_a:start_a + size]
+        seg_b = b[:, start_b:start_b + size]
+        blended = _merge_tensor_mode(seg_a, seg_b, mode,
+                                     match_percent=match_percent,
+                                     strength=strength)
+        out[:, start_a:start_a + size] = blended
+
+    return out.to(orig_dtype)
+
+
+def merge_image_embeds(clip, conditioning_a, conditioning_b, mode="average",
+                       strength=0.5, match_percent=0.5):
+    """Blend the image spans of two Qwen-VL conditionings (see
+    ``_blend_image_spans``). Requires both conditionings to have been encoded
+    with span capture (``QwenVLImageEmbedsEncode``); falls back to a
+    whole-sequence blend when span info is missing."""
+    a_t, spans_a = _structure_tensor_and_spans(conditioning_a)
+    b_t, spans_b = _structure_tensor_and_spans(conditioning_b)
+    if a_t is None or b_t is None:
+        return conditioning_a
+
+    out = []
+    items_a = list(conditioning_a if isinstance(conditioning_a, (list, tuple)) else [conditioning_a])
+    b_items = list(conditioning_b if isinstance(conditioning_b, (list, tuple)) else [conditioning_b])
+    # Per-item tensors for the write-back loop (concatenated tensor is only
+    # used for the early guard above).
+    for idx, item in enumerate(items_a):
+        if isinstance(item, (list, tuple)) and len(item) == 2 \
+                and isinstance(item[0], torch.Tensor) and isinstance(item[1], dict):
+            cond_t, extras = item
+            b_item = b_items[idx] if idx < len(b_items) else None
+            b_t_item = _extract_cond_tensor(b_item) if b_item is not None else None
+            if b_t_item is not None:
+                new_t = _blend_image_spans(cond_t, b_t_item, spans_a, spans_b,
+                                           mode=mode, strength=strength,
+                                           match_percent=match_percent)
+                new_extras = dict(extras)
+                # Keep span metadata valid: spans now describe the blended
+                # image tokens at a's positions.
+                new_extras["image_spans"] = [list(s) for s in spans_a]
+                out.append([new_t, new_extras])
+            else:
+                out.append([cond_t, dict(extras)])
+        else:
+            out.append(item)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Batch reducers for style extraction from many image conditionings.
+#
+# Unlike pairwise merges, these compute statistics over the *whole* batch of
+# image-token spans at once, so each reducer produces a genuinely different
+# style signature. All operate per image-span (spans from the first
+# conditioning define the output layout; other inputs' spans are aligned by
+# index and truncated to the shortest span length).
+# ---------------------------------------------------------------------------
+
+_STYLE_REDUCERS = [
+    "mean",          # centroid of all images — the classic style average
+    "median",        # per-element median — robust to outlier images
+    "trimmed_mean",  # mean after dropping the most extreme `strength` fraction
+    "consensus",     # keep elements where most images agree in sign (strength = agreement ratio)
+    "dominant",      # per-element value from the image with max magnitude there
+    "spread",        # mean + strength * per-element std — amplifies what varies across images
+    "centroid_dir",  # unit-norm mean direction, rescaled to the batch's mean energy
+    # Batch-level versions of the classic merge modes (first input is the
+    # anchor, the rest of the batch is the "other" side):
+    "average",       # alias of mean
+    "norm_average",  # energy-matched mean — every image rescaled to the anchor's energy first
+    "weighted",      # anchor * (1 - strength) + mean(rest) * strength
+    "norm_weighted", # weighted, with mean(rest) energy-matched to the anchor
+    "add",           # sum of all images (scales with batch size)
+    "subtract",      # anchor - mean(rest) — what the anchor has that the batch doesn't
+    "max_magnitude", # alias of dominant
+    "min_magnitude", # per-element value from the image with min magnitude there
+    "top_match",     # average where most images are strong and agree in sign, else dominant (strength = match_percent)
+    "concat",        # keep every image's span as separate tokens, stacked back to back (multi-reference, not style extraction)
+    # Additional reducers:
+    "geometric_mean",  # exp(mean(log|x|)) * sign(mean) — multiplicative style: features present in ALL images survive
+    "harmonic_mean",   # N / sum(1/x) — punishes features that are weak in any image
+    "rms",             # root-mean-square — energy-preserving centroid, brighter than mean
+    "mode_stats",      # most frequent sign per element with mean magnitude of the agreeing images
+    "pca_style",       # first principal component of the batch — the dominant axis of variation
+    "outlier",         # the image furthest from the batch mean (strength = rank: 0 = most typical, 1 = most extreme)
+    "random",          # pick one image at random (seeded by strength * 1000)
+]
+
+# Modes that ignore the strength slider entirely.
+_STRENGTH_FREE = {
+    "mean", "median", "dominant", "centroid_dir",
+    "average", "norm_average", "add", "subtract",
+    "max_magnitude", "min_magnitude", "concat",
+    "geometric_mean", "harmonic_mean", "rms", "mode_stats", "pca_style",
+}
+
+
+def _item_spans(item):
+    """Read image spans from a single conditioning item's extras."""
+    if isinstance(item, (list, tuple)) and len(item) == 2 \
+            and isinstance(item[1], dict):
+        s = item[1].get("image_spans")
+        if isinstance(s, (list, tuple)):
+            return [tuple(x) for x in s]
+    return []
+
+
+def _structure_tensor_and_spans(s):
+    """Extract the sequence tensor and image spans from one conditioning
+    structure (a list of ``[tensor, dict]`` pairs).
+
+    Returns ``(tensor, spans)`` or ``(None, [])``. Multiple items are
+    concatenated along the token dimension (spans are relative to the full
+    sequence)."""
+    items = s if isinstance(s, (list, tuple)) else [s]
+    ts = []
+    spans = []
+    for item in items:
+        t = _extract_cond_tensor(item)
+        if t is None:
+            continue
+        ts.append(t)
+        spans.extend(_item_spans(item))
+    if not ts:
+        return None, []
+    tensor = ts[0] if len(ts) == 1 else torch.cat(ts, dim=1)
+    return tensor, spans
+
+
+def _collect_span_tensors(structures):
+    """Extract per-structure image-span tensors for batch reduction.
+
+    Returns ``(spans, stack)`` where ``spans`` is the span list of the first
+    structure (output layout) and ``stack`` is a tensor ``(N, B, T, D)`` of
+    the aligned span segments from every structure (truncated to the shortest
+    span, batch-matched to the first). Structures without span info
+    contribute their full sequence, aligned by token position."""
+    tensors = []
+    ref_spans = None
+    ref_batch = None
+    for s in structures:
+        t, spans = _structure_tensor_and_spans(s)
+        if t is None:
+            continue
+        if ref_spans is None:
+            ref_spans = spans
+            ref_batch = t.shape[0]
+        tensors.append((t, spans))
+
+    if not tensors:
+        return [], None
+
+    # Determine the per-index segment length: min across structures.
+    n_spans = min(len(spans) for _, spans in tensors) if all(tensors[i][1] for i in range(len(tensors))) else 0
+    if n_spans == 0:
+        # Fall back to whole-sequence alignment: truncate all to the shortest
+        # sequence and treat it as one span.
+        seq = min(t.shape[1] for t, _ in tensors)
+        segs = [_match_batch(t[:, :seq].float(), ref_batch) for t, _ in tensors]
+        return [(0, seq)], torch.stack(segs, dim=0)
+
+    stack = []
+    for t, spans in tensors:
+        parts = []
+        for i in range(n_spans):
+            start, size = int(spans[i][0]), int(spans[i][1])
+            parts.append(t[:, start:start + size].float())
+        stack.append(torch.cat(parts, dim=1))
+    min_len = min(s.shape[1] for s in stack)
+    stack = [_match_batch(s[:, :min_len], ref_batch) for s in stack]
+    # Report spans in the first structure's layout, truncated to min_len.
+    out_spans = []
+    off = 0
+    for i in range(n_spans):
+        size = int(ref_spans[i][1])
+        size = max(0, min(size, min_len - off))
+        if size <= 0:
+            break
+        out_spans.append((int(ref_spans[i][0]), size))
+        off += size
+        if off >= min_len:
+            break
+    return out_spans, torch.stack(stack, dim=0)
+
+
+def _reduce_style_tensor(stack, mode, strength, harmonic_sign="clamp_positive"):
+    """Reduce a ``(N, B, T, D)`` stack of span tensors to ``(B, T, D)``."""
+    n = stack.shape[0]
+    if n == 1:
+        return stack[0]
+    s = float(min(max(strength, 0.0), 1.0))
+
+    if mode == "median":
+        return stack.median(dim=0).values
+
+    if mode == "trimmed_mean":
+        # Drop the most extreme fraction of images per element (by distance
+        # from the median), then average the rest. `strength` = fraction to
+        # drop from each side (0 = plain mean, 0.5 = median).
+        keep = n - 2 * int(round(s * n / 2.0))
+        keep = max(1, min(n, keep))
+        if keep >= n:
+            return stack.mean(dim=0)
+        med = stack.median(dim=0, keepdim=True).values
+        dist = (stack - med).abs().sum(dim=(-1, -2), keepdim=True)
+        order = dist.argsort(dim=0)  # (N, B, 1, 1)
+        sel = order[:keep]
+        return stack.gather(0, sel.expand(sel.shape[:1] + stack.shape[1:])).mean(dim=0)
+
+    if mode == "consensus":
+        # Keep an element only where enough images agree in sign; where they
+        # disagree, shrink toward zero (cancellation) instead of averaging
+        # conflicting features. `strength` = required agreement ratio.
+        ratio = 0.5 + s * 0.5  # 0.5..1.0
+        signs = stack.sign()
+        pos_frac = (signs > 0).float().mean(dim=0)
+        neg_frac = (signs < 0).float().mean(dim=0)
+        agree = torch.maximum(pos_frac, neg_frac)
+        mean = stack.mean(dim=0)
+        return mean * (agree >= ratio).float() * agree.clamp(min=0.0)
+
+    if mode == "dominant":
+        # Per element, take the value from the image whose magnitude there is
+        # largest — a "strongest feature wins" signature.
+        idx = stack.abs().argmax(dim=0, keepdim=True)
+        return stack.gather(0, idx.expand(1, *stack.shape[1:])).squeeze(0)
+
+    if mode == "spread":
+        # mean + strength * std: keeps the style centroid but amplifies the
+        # directions in which the images actually differ — good for turning
+        # a diverse set into a "characterful" style rather than a mushy mean.
+        mean = stack.mean(dim=0)
+        if s <= 0.0:
+            return mean
+        std = stack.std(dim=0)
+        return mean + s * std
+
+    if mode == "centroid_dir":
+        # Unit-norm mean direction (pure style direction, magnitude-free),
+        # rescaled to the batch's mean per-token energy.
+        direction = _unit_norm_flat(stack.mean(dim=0))
+        energy = _energy_norm(stack).mean(dim=0)
+        return direction * energy
+
+    # Batch-level versions of the classic merge modes. The first image is
+    # the anchor; the rest of the batch is reduced to mean(rest) first, so
+    # these stay distinct no matter how large the batch is.
+    anchor = stack[0]
+    rest = stack[1:].mean(dim=0) if n > 1 else anchor
+
+    if mode == "norm_average":
+        # Energy-match every image to the anchor before averaging, so no
+        # single high-energy image dominates the centroid.
+        matched = torch.stack(
+            [_match_energy(anchor, stack[i]) for i in range(n)], dim=0)
+        return matched.mean(dim=0)
+
+    if mode == "weighted":
+        return anchor * (1.0 - s) + rest * s
+
+    if mode == "norm_weighted":
+        return anchor * (1.0 - s) + _match_energy(anchor, rest) * s
+
+    if mode == "add":
+        return stack.sum(dim=0)
+
+    if mode == "subtract":
+        # anchor - mean(rest): keeps only what the anchor has that the rest
+        # of the batch doesn't — a "difference from the crowd" signature.
+        return anchor - rest
+
+    if mode == "min_magnitude":
+        idx = stack.abs().argmin(dim=0, keepdim=True)
+        return stack.gather(0, idx.expand(1, *stack.shape[1:])).squeeze(0)
+
+    if mode == "top_match":
+        # Elements where most images are in the top `s` fraction by magnitude
+        # AND agree in sign get averaged; everywhere else the dominant
+        # image's value wins. `strength` = match_percent (0..1).
+        # Sort-based threshold: torch.quantile has an element-count limit on
+        # CUDA that large spans can exceed.
+        mp = s
+        masks = []
+        for x in stack:
+            if mp < 1.0:
+                mag_flat = x.abs().flatten().float()
+                k = max(1, int(round(mp * mag_flat.numel())))
+                thresh = mag_flat.sort(descending=True).values[k - 1]
+                masks.append(x.abs() >= thresh)
+            else:
+                masks.append(torch.ones_like(x, dtype=torch.bool))
+        masks = torch.stack(masks, dim=0)
+        signs = torch.stack([x.sign() for x in stack], dim=0)
+        match = masks.all(dim=0) & (signs == signs[0:1]).all(dim=0)
+        avg = stack.mean(dim=0)
+        idx = stack.abs().argmax(dim=0, keepdim=True)
+        fallback = stack.gather(0, idx.expand(1, *stack.shape[1:])).squeeze(0)
+        return torch.where(match, avg, fallback)
+
+    if mode == "max_magnitude":
+        return stack.gather(0, stack.abs().argmax(dim=0, keepdim=True)
+                            .expand(1, *stack.shape[1:])).squeeze(0)
+
+    if mode == "average":
+        return stack.mean(dim=0)
+
+    if mode == "geometric_mean":
+        # exp(mean(log|x|)) with the batch-mean sign: a feature survives only
+        # if it is consistently present across ALL images — multiplicative
+        # consensus, much stricter than the arithmetic mean.
+        mag = stack.abs().clamp_min(1e-8)
+        gm = torch.exp(torch.log(mag).mean(dim=0))
+        sign = stack.mean(dim=0).sign()
+        return gm * sign
+
+    if mode == "harmonic_mean":
+        # N / sum(1/x): punishes any feature that is weak in even one image —
+        # the "must be present everywhere" centroid.
+        #
+        # ``harmonic_sign`` controls how negative values are treated:
+        #   clamp_positive — clamp negatives up to +eps (legacy behavior):
+        #     any feature negative in even ONE image is crushed toward zero,
+        #     acting as a strict positive-consensus filter.
+        #   signed — keep the sign: tiny magnitudes of either sign dominate
+        #     the reciprocal, so features near zero in any image (either
+        #     sign) are suppressed, but consistently negative features
+        #     survive as negative.
+        if harmonic_sign == "signed":
+            safe = torch.where(stack.abs() < 1e-8,
+                               torch.sign(stack) * 1e-8,
+                               stack)
+        else:
+            safe = stack.clamp_min(1e-8)
+        return n / (1.0 / safe).sum(dim=0)
+
+    if mode == "rms":
+        # Root-mean-square: energy-preserving centroid. Unlike the mean it
+        # never cancels opposing signs, so it stays "bright" where images
+        # disagree.
+        return stack.pow(2).mean(dim=0).sqrt()
+
+    if mode == "mode_stats":
+        # Most frequent sign per element; magnitude is the mean of the images
+        # that share that sign. Disagreeing images are excluded rather than
+        # averaged in.
+        signs = stack.sign()
+        pos_frac = (signs > 0).float().mean(dim=0)
+        neg_frac = (signs < 0).float().mean(dim=0)
+        pos_w = pos_frac / (pos_frac + neg_frac).clamp_min(1e-8)
+        take_pos = pos_w >= 0.5
+        mag = stack.abs().mean(dim=0)
+        pos_mean = torch.where(stack > 0, stack.abs(), torch.zeros_like(stack)).sum(dim=0) / pos_frac.clamp_min(1e-8) / n
+        neg_mean = torch.where(stack < 0, stack.abs(), torch.zeros_like(stack)).sum(dim=0) / neg_frac.clamp_min(1e-8) / n
+        return torch.where(take_pos, pos_mean, -neg_mean) * (mag > 0).float()
+
+    if mode == "pca_style":
+        # First principal component across the N images, computed per token
+        # position in feature space (vectorized power iteration — no SVD).
+        # Output: the dominant variation direction, scaled per token by the
+        # mean absolute projection of the images onto it (how much style
+        # variation actually lives along that axis).
+        n_, b_, t_, d_ = stack.shape
+        outs = []
+        for b in range(b_):
+            X = stack[:, b]                                   # (N, T, D)
+            Xc = X - X.mean(dim=0, keepdim=True)              # center across images
+            V = torch.randn(t_, d_, device=X.device, dtype=X.dtype)
+            V = V / V.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            for _ in range(8):
+                U = torch.einsum('ntd,td->nt', Xc, V)         # (N, T) scores
+                V = torch.einsum('ntd,nt->td', Xc, U)         # (T, D) direction
+                V = V / V.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+            energy = torch.einsum('ntd,td->nt', Xc, V).abs().mean(dim=0)  # (T,)
+            outs.append((V * energy.unsqueeze(-1)).unsqueeze(0))
+        return torch.cat(outs, dim=0).to(stack.dtype)         # (B, T, D)
+
+    if mode == "outlier":
+        # Pick the image whose distance from the batch mean ranks at
+        # `strength`: 0 = the most typical image, 1 = the most extreme
+        # outlier. Useful to grab "the most representative" or "the most
+        # characterful" single image from the batch.
+        mean = stack.mean(dim=0, keepdim=True)
+        dist = (stack - mean).pow(2).sum(dim=(-1, -2))  # (N, B)
+        order = dist.argsort(dim=0)  # typical -> extreme
+        rank = int(round(s * (n - 1)))
+        rank = max(0, min(n - 1, rank))
+        idx = order[rank]  # (B,)
+        sel = stack.gather(0, idx.view(1, -1, 1, 1).expand(1, *stack.shape[1:])).squeeze(0)
+        return sel
+
+    if mode == "random":
+        # Deterministic random pick: strength * 1000 acts as the seed, so
+        # the same strength always picks the same image.
+        seed = int(round(s * 1000))
+        g = torch.Generator(device="cpu")
+        g.manual_seed(seed)
+        idx = torch.randint(0, n, (1,), generator=g).item()
+        return stack[idx]
+
+    # default: mean
+    return stack.mean(dim=0)
+
+
+def _reduce_style_concat(stack, spans):
+    """Concat reducer: keep every image's span as separate tokens, stacked
+    back to back — the analogue of IPAdapter Combine Embeds' ``concat``,
+    where the batch dimension grows instead of the images being averaged.
+
+    Returns ``(reduced, out_spans)``: the concatenated tensor ``(B, N*T, D)``
+    and the span list describing each image's segment inside it (all at the
+    same start, sequential in the token dim)."""
+    n = stack.shape[0]
+    parts = [stack[i] for i in range(n)]  # each (B, T, D)
+    reduced = torch.cat(parts, dim=1)     # (B, N*T, D)
+    total = reduced.shape[1]
+    per = total // n if n else total
+    out_spans = [(0, per)]                # one span covering the whole block
+    return reduced, out_spans
+
+
+# ---------------------------------------------------------------------------
+# Style metrics: quantify how strong / coherent the merged style is, and
+# amplify it. All metrics are computed on the (N, B, T, D) span stack and the
+# reduced (B, T, D) tensor, in float32, and averaged over batch items.
+# ---------------------------------------------------------------------------
+
+def compute_style_metrics(stack, reduced):
+    """Quantify the merged style.
+
+    Returns a dict of scalar floats:
+      coherence   mean cosine similarity of each image's span to the reduced
+                  style (1.0 = all images identical, low = diverse batch)
+      energy      L2 norm of the reduced style per token (absolute strength
+                  of the signal the model will attend to)
+      contrast    std across images along the reduced direction, relative to
+                  its energy (how much the images vary around the style)
+      distinct    distance of the reduced style from the *text* baseline is
+                  not available here; instead: fraction of elements whose
+                  magnitude exceeds 2x the batch mean magnitude (how peaked /
+                  selective the style signature is)
+      coverage    fraction of elements that survived reduction with
+                  meaningful magnitude (low = sparse, selective signature)
+    """
+    n = stack.shape[0]
+    b = stack.shape[1]
+    red = reduced.float()
+
+    # Per-batch-item metrics, then averaged.
+    coh_list, energy_list, contrast_list, distinct_list, coverage_list = [], [], [], [], []
+    for bi in range(b):
+        X = stack[:, bi].float()          # (N, T, D)
+        r = red[bi]                       # (T, D)
+
+        # Coherence: cosine similarity of each image to the reduced style.
+        rn = r / r.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        xn = X / X.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        cos = (xn * rn).sum(dim=-1)       # (N, T)
+        coh_list.append(cos.mean().item())
+
+        energy_list.append(r.norm(dim=-1).mean().item())
+
+        # Contrast: projection std of the images onto the style direction,
+        # normalized by style energy.
+        proj = (X * rn).sum(dim=-1)       # (N, T)
+        contrast_list.append((proj.std(dim=0) / proj.abs().mean(dim=0).clamp_min(1e-8)).mean().item())
+
+        # Distinctiveness: fraction of elements > 2x batch mean magnitude.
+        mag = X.abs().mean(dim=0)         # (T, D) mean magnitude per element
+        r_mag = r.abs()
+        distinct_list.append((r_mag > 2.0 * mag.clamp_min(1e-8)).float().mean().item())
+
+        # Coverage: fraction of elements with meaningful magnitude relative
+        # to the style's own scale.
+        scale = r_mag.mean().clamp_min(1e-8)
+        coverage_list.append((r_mag > 0.1 * scale).float().mean().item())
+
+    return {
+        "coherence": sum(coh_list) / b,
+        "energy": sum(energy_list) / b,
+        "contrast": sum(contrast_list) / b,
+        "distinct": sum(distinct_list) / b,
+        "coverage": sum(coverage_list) / b,
+    }
+
+
+def apply_style_boost(reduced, stack, boost):
+    """Amplify the merged style signal.
+
+    ``boost`` in 0..20. At 0 the reduced style is returned unchanged. The
+    amplification is *adaptive*: the gain per token is driven by how much the
+    images agree along each direction, so shared style features (high
+    coherence) get boosted hard while noisy, image-specific features are left
+    alone. This is what makes the style "strong" without blowing the whole
+    conditioning up.
+
+    gain = 1 + boost * agreement, where agreement is the per-element fraction
+    of images whose projection onto the reduced direction shares its sign
+    (0..1). Energy is renormalized so the boost changes *directional
+    emphasis*, not overall loudness — the sampler is sensitive to absolute
+    energy, and uncontrolled scaling just shifts colors."""
+    if boost <= 0.0:
+        return reduced
+    boost = float(min(boost, 20.0))
+    n, b = stack.shape[0], stack.shape[1]
+    out = reduced.clone()
+    for bi in range(b):
+        X = stack[:, bi].float()          # (N, T, D)
+        r = reduced[bi].float()           # (T, D)
+        rn = r / r.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        proj = (X * rn).sum(dim=-1)       # (N, T) projections onto style dir
+        # Agreement: fraction of images whose projection has the same sign as
+        # the mean projection (i.e. the style direction is consistent).
+        mean_proj = proj.mean(dim=0, keepdim=True)          # (1, T)
+        agree = ((proj.sign() == mean_proj.sign()).float().mean(dim=0))  # (T,)
+        gain = 1.0 + boost * agree        # (T,)
+        boosted = r * gain.unsqueeze(-1)
+        # Renormalize energy to the original per-token norm.
+        orig_norm = r.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        new_norm = boosted.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        out[bi] = (boosted * (orig_norm / new_norm)).to(reduced.dtype)
+    return out
+
+
+def reduce_image_embeds(clip, structures, mode="mean", strength=0.5,
+                        harmonic_sign="clamp_positive",
+                        style_boost=0.0, return_metrics=False):
+    """Reduce many Qwen-VL conditionings to a single style conditioning.
+
+    ``structures`` is a list of conditioning structures (as produced by
+    ``QwenVLImageEmbedsEncode``). Text tokens come from the first structure
+    unchanged; the image-token spans of all structures are reduced with the
+    requested batch strategy (see ``_STYLE_REDUCERS``). The result keeps
+    ``image_spans`` metadata so it can be re-reduced or blended further.
+
+    ``harmonic_sign`` only affects the ``harmonic_mean`` mode — see
+    ``_reduce_style_tensor``.
+
+    ``style_boost`` adaptively amplifies the merged style (see
+    ``apply_style_boost``). ``return_metrics`` additionally returns a dict of
+    scalar style metrics (see ``compute_style_metrics``)."""
+    structures = [s for s in (structures or []) if s is not None]
+    if not structures:
+        raise ValueError("reduce_image_embeds: at least one conditioning is required.")
+    if len(structures) == 1:
+        if return_metrics:
+            spans0, stack0 = _collect_span_tensors(structures)
+            if stack0 is not None:
+                # stack0 is (1, B, T, D); reduce trivially to get the
+                # "merged" tensor for metrics without touching the output.
+                metrics = compute_style_metrics(stack0, stack0[0])
+            else:
+                metrics = {}
+            return structures[0], metrics
+        return structures[0]
+
+    spans, stack = _collect_span_tensors(structures)
+    if stack is None:
+        if return_metrics:
+            return structures[0], {}
+        return structures[0]
+
+    if mode == "concat":
+        # Multi-reference: every image's span becomes separate tokens stacked
+        # back to back. The output sequence grows to text + N*T image tokens,
+        # so it cannot be written back into the first structure's layout —
+        # a new conditioning is built from the first structure's text tokens
+        # followed by the concatenated image block.
+        reduced, out_spans = _reduce_style_concat(stack, spans)  # (B, N*T, D)
+        reduced = apply_style_boost(reduced, stack, style_boost)
+        metrics = compute_style_metrics(stack, reduced) if return_metrics else None
+        base = structures[0]
+        items = list(base if isinstance(base, (list, tuple)) else [base])
+        out = []
+        for item in items:
+            if isinstance(item, (list, tuple)) and len(item) == 2 \
+                    and isinstance(item[0], torch.Tensor) and isinstance(item[1], dict):
+                cond_t, extras = item
+                # Replace the first structure's image span(s) with the
+                # concatenated block; text before the span is kept.
+                first_start = int(spans[0][0]) if spans else cond_t.shape[1]
+                prefix = cond_t[:, :first_start]
+                new_t = torch.cat([prefix, reduced.to(cond_t.dtype)], dim=1)
+                new_extras = dict(extras)
+                new_extras["image_spans"] = [[first_start, reduced.shape[1]]]
+                out.append([new_t, new_extras])
+            else:
+                out.append(item)
+        return (out, metrics) if return_metrics else out
+
+    reduced = _reduce_style_tensor(stack, mode, strength,
+                                   harmonic_sign=harmonic_sign)  # (B, T', D)
+    reduced = apply_style_boost(reduced, stack, style_boost)
+    metrics = compute_style_metrics(stack, reduced) if return_metrics else None
+
+    base = structures[0]
+    out = []
+    items = list(base if isinstance(base, (list, tuple)) else [base])
+    seg_iter = 0
+    for item in items:
+        if isinstance(item, (list, tuple)) and len(item) == 2 \
+                and isinstance(item[0], torch.Tensor) and isinstance(item[1], dict):
+            cond_t, extras = item
+            new_t = cond_t.clone()
+            # Write the reduced segments back into the span positions.
+            off = 0
+            for start, size in spans:
+                seg = reduced[:, off:off + size]
+                end = min(cond_t.shape[1], int(start) + int(size))
+                seg_len = end - int(start)
+                if seg_len <= 0:
+                    break
+                new_t[:, int(start):end] = seg[:, :seg_len].to(new_t.dtype)
+                off += size
+            new_extras = dict(extras)
+            new_extras["image_spans"] = [list(s) for s in spans]
+            out.append([new_t, new_extras])
+        else:
+            out.append(item)
+    return (out, metrics) if return_metrics else out
+
+
+def compile_edit(clip, prompt, images_with_size=None, llama_template=None, fixed_res=None, image_positions=None, capture_spans=False, use_cache=True):
     """Encode an edit prompt with optional reference images.
 
     ``llama_template`` selects the encoder's chat template. When ``None``, the
@@ -306,7 +1048,18 @@ def compile_edit(clip, prompt, images_with_size=None, llama_template=None, fixed
     MRoPE h/w position ids are rewritten so the image claims to sit at that
     spot of a virtual canvas — positional placement without paying tokens for
     the canvas itself (the corner-of-black-canvas trick, token-free).
-    """
+
+    ``capture_spans``, when True, records each image's token span
+    ``(start, size)`` into the conditioning extras under ``"image_spans"`` so
+    downstream nodes can blend image tokens between encodings
+    (see ``QwenVLImageEmbedsMerge``).
+
+    ``use_cache``: identical encodes are served from a module-level cache
+    (keyed by clip identity, prompt, image pixel hashes, template, positions
+    and flags). GPU encoding is nondeterministic, so without the cache every
+    queue run produces slightly different hidden states for the same inputs.
+    Cached entries are deep-copied to CPU; the caller may mutate the returned
+    conditioning freely."""
     if not _COMFY_AVAILABLE:
         raise RuntimeError("Edit encode requires ComfyUI (comfy.utils, node_helpers).")
 
@@ -328,19 +1081,74 @@ def compile_edit(clip, prompt, images_with_size=None, llama_template=None, fixed
 
     full_prompt = image_prompt + prompt if image_prompt else prompt
 
+    cache_key = None
+    if use_cache:
+        cache_key = (
+            clip_signature(clip),
+            full_prompt,
+            llama_template,
+            tuple(image_signature(img) for img in images_vl),
+            tuple(tuple(p) if p is not None else None for p in (image_positions or [])),
+            bool(capture_spans),
+        )
+        cached = _ENCODE_CACHE.get(cache_key)
+        if cached is not None:
+            return _clone_conditioning(cached)
+
     tokens = clip.tokenize(
         full_prompt,
         images=images_vl if images_vl else None,
         llama_template=llama_template,
     )
-    enter, exit_ = _qwen_image_positions_ctx(clip, image_positions)
-    enter()
+    pos_enter, pos_exit = _qwen_image_positions_ctx(clip, image_positions)
+    span_enter, span_exit, spans = _capture_image_spans(clip) if capture_spans \
+        else ((lambda: None), (lambda: None), [])
+    pos_enter()
+    span_enter()
     try:
         conditioning = clip.encode_from_tokens_scheduled(tokens)
     finally:
-        exit_()
+        span_exit()
+        pos_exit()
+
+    if capture_spans and spans:
+        for item in (conditioning if isinstance(conditioning, list) else [conditioning]):
+            if isinstance(item, (list, tuple)) and len(item) == 2 \
+                    and isinstance(item[1], dict):
+                item[1]["image_spans"] = [list(s) for s in spans]
+
+    if cache_key is not None:
+        _ENCODE_CACHE.put(cache_key, _clone_conditioning(conditioning, to_cpu=True))
 
     return conditioning
+
+
+def _clone_conditioning(structure, to_cpu=False):
+    """Deep-copy a conditioning structure (list of [tensor, dict] pairs).
+
+    With ``to_cpu`` the tensors are copied to CPU so cached entries never
+    pin VRAM. Mutable extras (e.g. ``image_spans`` lists) are copied too, so
+    callers can mutate the returned conditioning without touching the
+    cache."""
+    if isinstance(structure, list):
+        out = []
+        for item in structure:
+            if isinstance(item, (list, tuple)) and len(item) == 2 \
+                    and isinstance(item[0], torch.Tensor) and isinstance(item[1], dict):
+                t = item[0]
+                if to_cpu:
+                    t = t.detach().to("cpu", copy=True)
+                else:
+                    t = t.clone()
+                extras = dict(item[1])
+                extras = {k: (list(v) if isinstance(v, list) else
+                              (dict(v) if isinstance(v, dict) else v))
+                          for k, v in extras.items()}
+                out.append([t, extras])
+            else:
+                out.append(item)
+        return out
+    return structure
 
 
 def _scale_cond_tensor(t, scale, weights=None):
@@ -459,6 +1267,91 @@ def guidance_conditioning(structure, ref_structure, strength, per_band_strengths
 
 def guidance(conditioning, reference, strength, n_bands=None):
     return guidance_conditioning(conditioning, reference, strength, per_band_strengths=None, n_bands=n_bands)
+
+
+def _encode_mean_tokens(clip, text):
+    """Encode one prompt and return its mean token vector, shape ``(d,)``."""
+    tokens = clip.tokenize(text)
+    cond = clip.encode_from_tokens_scheduled(tokens)
+    mean = _cond_mean_tokens(cond)
+    if mean is None:
+        raise ValueError("empty encoding for prompt: " + text[:80])
+    return mean
+
+
+def _cond_mean_tokens(structure):
+    """Mean token vector of a conditioning structure (list of [tensor, dict]
+    items, a single such item, or a bare tensor), shape ``(d,)``, or None if
+    no tensors are present."""
+    if isinstance(structure, (list, tuple)):
+        vecs = [v for v in (_cond_mean_tokens(item) for item in structure)
+                if v is not None]
+        if not vecs:
+            return None
+        return torch.stack(vecs).mean(dim=0)
+    t = _extract_cond_tensor(structure)
+    if t is None or t.numel() == 0:
+        return None
+    return t.detach().float().mean(dim=1).mean(dim=0)
+
+
+def _parse_prompt_pairs(pairs, subjects=""):
+    """Parse 'A ||| B' lines, optionally expanded over one subject per line."""
+    subs = [s.strip() for s in str(subjects).splitlines()
+            if s.strip() and not s.strip().startswith("#")] or [None]
+    out = []
+    for line in str(pairs).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "|||" not in line:
+            raise ValueError("each pair line needs 'A ||| B', got: " + line[:80])
+        a, b = (x.strip() for x in line.split("|||", 1))
+        for s in subs:
+            out.append((a.replace("{subject}", s), b.replace("{subject}", s)) if s else (a, b))
+    if not out:
+        raise ValueError("no prompt pairs given")
+    return out
+
+
+def _pair_direction(clip, pairs, subjects=""):
+    """Dials-style direction: mean_tokens(enc(B)) - mean_tokens(enc(A)),
+    averaged over all prompt pairs (and subjects), so wording and subjects
+    that differ across pairs cancel."""
+    parsed = _parse_prompt_pairs(pairs, subjects)
+    acc = None
+    for a, b in parsed:
+        d = _encode_mean_tokens(clip, b) - _encode_mean_tokens(clip, a)
+        acc = d if acc is None else acc + d
+    return acc / float(len(parsed))
+
+
+def guidance_direction(structure, direction, strength, n_bands=None):
+    """Amplify conditioning along a fixed unit direction (dial-style).
+
+    Same projection amplification as ``guidance_conditioning``, but the
+    direction is supplied by the caller (e.g. derived from prompt pairs)
+    instead of being computed from a reference conditioning."""
+    if isinstance(structure, list):
+        return [guidance_direction(item, direction, strength, n_bands=n_bands)
+                for item in structure]
+    if isinstance(structure, torch.Tensor):
+        d = direction.detach().to(device=structure.device)
+        cond_bands, band_d = _split_bands(structure, n_bands)
+        dir_bands, dir_band_d = _split_bands(d, n_bands)
+        if cond_bands is not None and dir_bands is not None and band_d == dir_band_d:
+            dir_unit = _unit_norm_dim(dir_bands)
+            dir_exp = dir_unit.view(*([1] * (cond_bands.dim() - 2)), *dir_unit.shape)
+            cond_f = cond_bands.float()
+            proj = (cond_f * dir_exp).sum(dim=-1, keepdim=True)
+            out = cond_f + float(strength) * proj * dir_exp
+            return _merge_bands(out).to(structure.dtype)
+        # whole-tensor fallback
+        d_unit = _unit_norm_dim(d.reshape(1, 1, -1)).reshape(-1)
+        cond_f = structure.float()
+        proj = (cond_f * d_unit).sum(dim=-1, keepdim=True)
+        return (cond_f + float(strength) * proj * d_unit).to(structure.dtype)
+    return structure
 
 
 def _top_percent_mask(t, percent, dim=-1):
@@ -1271,6 +2164,63 @@ class RebalanceGuider:
         return (guidance(positive, negative, guidance_strength),)
 
 
+class RebalanceGuiderB:
+    """Rebalance Guider variant: the steering direction comes from prompt
+    pairs instead of the negative conditioning.
+
+    For each pair (A, B) the direction is mean_tokens(enc(B)) -
+    mean_tokens(enc(A)); the dial is the mean over pairs, so wording and
+    subjects that differ across pairs cancel. The positive conditioning is
+    amplified along that direction with the same projection used by
+    Rebalance Guider.
+
+    Alternatively, connect ``conditioning_a`` and ``conditioning_b`` to use
+    mean_tokens(B) - mean_tokens(A) from two conditionings directly (no clip
+    or pairs needed) — a single-pair version of the same idea."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "positive": ("CONDITIONING",),
+            "guidance_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 2.0, "step": 0.01}),
+        },
+        "optional": {
+            "clip": ("CLIP",),
+            "pairs": ("STRING", {
+                "multiline": True,
+                "default": "a photo of a cat ||| a photo of a dog",
+                "tooltip": "One pair per line: 'A ||| B'. Direction = enc(B) - enc(A), averaged over all pairs. Used when clip is connected."}),
+            "subjects": ("STRING", {
+                "multiline": True,
+                "default": "",
+                "tooltip": "Optional subjects, one per line. Each pair is expanded for every subject so subject content cancels in the average."}),
+            "conditioning_a": ("CONDITIONING", {"tooltip": "Baseline conditioning (A). When connected together with conditioning_b, replaces clip + pairs."}),
+            "conditioning_b": ("CONDITIONING", {"tooltip": "Target conditioning (B). When connected together with conditioning_a, replaces clip + pairs."}),
+        }}
+
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("conditioning",)
+    FUNCTION = "main"
+    CATEGORY = "Rebalance-Pack/conditioning"
+
+    def main(self, positive, guidance_strength=0.500, clip=None, pairs="",
+             subjects="", conditioning_a=None, conditioning_b=None):
+        if not _COMFY_AVAILABLE:
+            raise RuntimeError("Rebalance Guider B requires ComfyUI (node_helpers).")
+        if conditioning_a is not None and conditioning_b is not None:
+            mean_a = _cond_mean_tokens(conditioning_a)
+            mean_b = _cond_mean_tokens(conditioning_b)
+            if mean_a is None or mean_b is None:
+                raise ValueError("conditioning_a / conditioning_b contain no tensors.")
+            direction = mean_b - mean_a
+        elif clip is not None:
+            direction = _pair_direction(clip, pairs, subjects)
+        else:
+            raise ValueError("Rebalance Guider B needs either a clip (with pairs) "
+                             "or both conditioning_a and conditioning_b.")
+        return (guidance_direction(positive, direction, guidance_strength),)
+
+
 class StepRebalance:
     """Split a conditioning schedule at a step threshold."""
 
@@ -1609,26 +2559,215 @@ class ConditioningUnfreeze:
         return (conditioning,)
 
 
+class QwenVLImageEmbedsEncode:
+    """Encode text + reference images for Qwen3-VL style encoders (Krea),
+    recording image token spans so encodings can be blended downstream
+    (see Qwen VL Image Embeds Merge). Same encoding as Qwen VL List Encode
+    Rebalance, plus span metadata.
+
+    Supports large list batches (200+ images): with ``INPUT_IS_LIST`` every
+    image input arrives as a list, and each image is encoded in its own
+    forward pass (chunked by ``batch_size`` when the encoder supports batched
+    image tokens) so VRAM stays bounded regardless of list length."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "text": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+            "clip": ("CLIP",),
+        },
+        "optional": {
+            "image1": ("IMAGE",),
+            "image1_tokens": (["low", "normal", "high", "max", "focal"], {"default": "normal"}),
+            "image2": ("IMAGE",),
+            "image2_tokens": (["low", "normal", "high", "max", "focal"], {"default": "normal"}),
+            "image3": ("IMAGE",),
+            "image3_tokens": (["low", "normal", "high", "max", "focal"], {"default": "normal"}),
+            "image4": ("IMAGE",),
+            "image4_tokens": (["low", "normal", "high", "max", "focal"], {"default": "normal"}),
+        }}
+
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("conditioning",)
+    OUTPUT_IS_LIST = (True,)
+    INPUT_IS_LIST = True
+    FUNCTION = "main"
+    CATEGORY = "Rebalance-Pack/conditioning"
+
+    @staticmethod
+    def _first(value, default=None):
+        if isinstance(value, (list, tuple)):
+            return value[0] if value else default
+        return value
+
+    @staticmethod
+    def _as_items(value):
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            return [v for v in value if v is not None]
+        return [value]
+
+    def main(self, text, clip,
+             image1=None, image1_tokens="normal",
+             image2=None, image2_tokens="normal",
+             image3=None, image3_tokens="normal",
+             image4=None, image4_tokens="normal"):
+        if not _COMFY_AVAILABLE:
+            raise RuntimeError("Qwen VL Image Embeds Encode requires ComfyUI (comfy.utils).")
+
+        clip = self._first(clip)
+        texts = text if isinstance(text, (list, tuple)) else [text]
+
+        slots = [
+            (self._as_items(image1), self._first(image1_tokens, "normal")),
+            (self._as_items(image2), self._first(image2_tokens, "normal")),
+            (self._as_items(image3), self._first(image3_tokens, "normal")),
+            (self._as_items(image4), self._first(image4_tokens, "normal")),
+        ]
+
+        # Number of encode passes = max slot length (1 if no images, so the
+        # node still runs once per text prompt).
+        n_sets = max(len(items) for items, _ in slots) or 1
+
+        results = []
+        for t in texts:
+            prompt = "" + _align_prompt(t)
+            for i in range(n_sets):
+                images_with_size = []
+                for items, token in slots:
+                    img = items[min(i, len(items) - 1)] if items else None
+                    images_with_size.append((img, token))
+                has_image = any(img is not None for img, _ in images_with_size)
+                images = images_with_size if has_image else None
+                results.append(compile_edit(clip, prompt, images, capture_spans=True))
+
+        return (results,)
+
+
+class QwenVLImageEmbedsMerge:
+    """Reduce many Qwen-VL conditionings (Krea encoder) to a single style
+    conditioning. The image-token spans of all inputs are reduced with a
+    batch-level strategy (see the mode list); text tokens come from the first
+    input unchanged.
+
+    Designed for large batches: with ``INPUT_IS_LIST`` it accepts a list of
+    200+ conditionings and reduces them in one pass over the collected span
+    tensors. ``strength`` tunes the selected strategy and is hidden for modes
+    that don't use it (mean, median, dominant, rms, pca_style, concat, ...).
+    Its meaning per mode:
+      trimmed_mean  fraction of outliers to drop (0 = mean, 0.5 = median)
+      consensus     required sign-agreement ratio (0.5 .. 1.0)
+      spread        std gain on top of the mean
+      weighted / norm_weighted   anchor vs crowd blend
+      top_match     magnitude match_percent
+      outlier       rank from most typical (0) to most extreme (1)
+      random        seed (strength * 1000)"""
+
+    _MODES = _STYLE_REDUCERS
+    _STRENGTH_FREE = _STRENGTH_FREE
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "conditioning": ("CONDITIONING",),
+            "mode": (cls._MODES, {"default": "mean"}),
+            "strength": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "style_boost": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 20.0, "step": 0.05,
+                                      "tooltip": "Adaptively amplify the merged style. Gain per token scales with how much the images agree along the style direction, so shared features get boosted and noise doesn't. Energy is renormalized. 0 = off; 1-2 is a good starting range; go higher (4-10+) for a hard-hitting style."}),
+        },
+        "optional": {
+            "conditioning_2": ("CONDITIONING",),
+            "harmonic_sign": (["clamp_positive", "signed"], {"default": "clamp_positive"}),
+        }}
+
+    RETURN_TYPES = ("CONDITIONING", "FLOAT", "FLOAT", "FLOAT", "FLOAT", "FLOAT")
+    RETURN_NAMES = ("conditioning", "coherence", "energy", "contrast", "distinct", "coverage")
+    FUNCTION = "main"
+    CATEGORY = "Rebalance-Pack/conditioning"
+    INPUT_IS_LIST = True
+    OUTPUT_IS_LIST = (True, False, False, False, False, False)
+
+    def main(self, conditioning, mode="mean",
+             strength=0.2, style_boost=0.0, conditioning_2=None,
+             harmonic_sign="clamp_positive"):
+        # With INPUT_IS_LIST=True widget inputs also arrive as lists; unwrap.
+        if isinstance(mode, (list, tuple)):
+            mode = mode[0] if mode else "mean"
+        if isinstance(strength, (list, tuple)):
+            strength = strength[0] if strength else 0.2
+        if isinstance(style_boost, (list, tuple)):
+            style_boost = style_boost[0] if style_boost else 0.0
+        if isinstance(harmonic_sign, (list, tuple)):
+            harmonic_sign = harmonic_sign[0] if harmonic_sign else "clamp_positive"
+        mode = (mode or "mean").lower()
+        harmonic_sign = (harmonic_sign or "clamp_positive").lower()
+        if harmonic_sign not in ("clamp_positive", "signed"):
+            harmonic_sign = "clamp_positive"
+        # Strength is meaningless for strength-free modes; force a neutral
+        # value so results don't depend on a stale slider.
+        if mode in self._STRENGTH_FREE:
+            strength = 0.0
+        strength = float(min(max(strength, 0.0), 1.0))
+        style_boost = float(min(max(style_boost, 0.0), 20.0))
+
+        # Flatten both inputs into one stream of conditioning structures.
+        stream = []
+        for s in (conditioning, conditioning_2):
+            if s is None:
+                continue
+            if isinstance(s, (list, tuple)):
+                stream.extend([x for x in s if x is not None])
+            else:
+                stream.append(s)
+        if not stream:
+            raise ValueError("Qwen VL Image Embeds Merge: at least one conditioning is required.")
+
+        result, metrics = reduce_image_embeds(
+            None, stream, mode=mode, strength=strength,
+            harmonic_sign=harmonic_sign, style_boost=style_boost,
+            return_metrics=True)
+
+        # List-mode nodes must return EVERY output wrapped in a list.
+        # OUTPUT_IS_LIST only controls how downstream consumes it: the
+        # conditioning slot is (True,) so [result] is consumed as a list of
+        # structures; the metric slots are (False,) so ComfyUI unwraps the
+        # single-element list into a plain float.
+        m = metrics or {}
+        return ([result],
+                [m.get("coherence", 0.0)],
+                [m.get("energy", 0.0)],
+                [m.get("contrast", 0.0)],
+                [m.get("distinct", 0.0)],
+                [m.get("coverage", 0.0)])
+
+
 NODE_CLASS_MAPPINGS = {
     "RebalanceGuider": RebalanceGuider,
+    "RebalanceGuiderB": RebalanceGuiderB,
     "StepRebalance": StepRebalance,
     "RebalanceCFG": RebalanceCFG,
     "ConditioningMerge": ConditioningMerge,
     "ConditioningMergeMulti": ConditioningMergeMulti,
     "ConditioningMergeList": ConditioningMergeList,
     "QwenVLListEncodeRebalance": QwenVLListEncodeRebalance,
+    "QwenVLImageEmbedsEncode": QwenVLImageEmbedsEncode,
+    "QwenVLImageEmbedsMerge": QwenVLImageEmbedsMerge,
     "ConditioningFreeze": ConditioningFreeze,
     "ConditioningUnfreeze": ConditioningUnfreeze,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RebalanceGuider": "Rebalance Guider",
+    "RebalanceGuiderB": "Rebalance Guider B",
     "StepRebalance": "Step Rebalance",
     "RebalanceCFG": "Rebalance CFG Custom",
     "ConditioningMerge": "Conditioning Merge",
     "ConditioningMergeMulti": "Conditioning Merge (Multi)",
     "ConditioningMergeList": "Conditioning Merge (List)",
     "QwenVLListEncodeRebalance": "Qwen VL List Encode Rebalance",
+    "QwenVLImageEmbedsEncode": "Qwen VL Image Embeds Encode",
+    "QwenVLImageEmbedsMerge": "Qwen VL Image Embeds Merge",
     "ConditioningFreeze": "Conditioning Freeze",
     "ConditioningUnfreeze": "Conditioning Unfreeze",
 }
@@ -1651,6 +2790,7 @@ __all__ = [
     "merge_conditioning",
     "merge_conditioning_multi",
     "merge_conditioning_mode",
+    "merge_image_embeds",
     "ConditioningMerge",
     "ConditioningMergeMulti",
     "ConditioningMergeList",
@@ -1658,6 +2798,8 @@ __all__ = [
     "RebalanceGuider",
     "StepRebalance",
     "QwenVLListEncodeRebalance",
+    "QwenVLImageEmbedsEncode",
+    "QwenVLImageEmbedsMerge",
     "SYS_TEMPLATE",
     "RESOLUTIONS",
 ]

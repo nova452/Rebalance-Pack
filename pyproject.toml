@@ -2,15 +2,19 @@
 name = "ComfyUI-Conditioning-Rebalance"
 description = """A set of evolving nodes that balance ComfyUI for the best user experience.
 
-foundational: Omni Node, Input, Load Images, Load Image Newest, Load Image Full, Color Image, Concatenate, String (Inline), String to List, List String Index, Float Exact, Float 1.00, Float 10.00, Any, Switch
+foundational: Input, Any, Switch, Load Images, Load Images (Blaze), Load Image Newest, Load Image Full, Save Images, Color Image, Concatenate, String (Inline), String (Inline 5), String to List, List String Index, List Display, Float Exact, Float 1.00, Float 10.00
 
-utility: Image Resolution Cap, Image Aspect Ratio Crop, Mask Aspect Ratio Crop, Mask Uncrop, Image Uncrop, Border Mask, Mask Opacity,
+utility: Image Resolution Cap, Image Aspect Ratio Crop, Mask Aspect Ratio BBox, Uncrop Image, Uncrop Mask, Border Mask & Crop Detector, Mask Opacity
 
-conditioning: Conditioning Merge, Conditioning Merge Multi, Qwen VL List Encode Rebalance, Conditioning Freeze, Conditioning Unfreeze
+conditioning: Conditioning Merge, Conditioning Merge (Multi), Conditioning Merge (List), Conditioning Freeze, Conditioning Unfreeze, Qwen VL List Encode Rebalance, Qwen VL Image Embeds Encode, Qwen VL Image Embeds Merge
 
-model specific: Load LoRA (Block), Conditioning Krea 2 Rebalance, Krea 2 Edit Rebalance, Krea 2 Encode Rebalance, Conditioning Ideogram 4 Rebalance, Ideogram 4 Edit Rebalance, Ideogram 4 Encode Rebalance"""
-version = "2.3.0"
-license = { file = "LICENSE.txt" }
+sampling: Rebalance Guider, Rebalance Guider B, Rebalance CFG Custom, Step Rebalance, Sigmas Rebalance, Sampler Rebalance
+
+lora: Load LoRA (Block), Load LoRA Krea2 (Block), Load LoRA Moss Image (Block), Load LoRA H3 (Block), Load LoRA H3 Image (Block), Load LoRA Folder (Block), Load LoRA Folder Moss Image (Block), Load LoRA Folder H3 (Block), Load LoRA Folder H3 Image (Block)
+
+model specific: Conditioning Krea2 Rebalance, Krea 2 Image Edit Rebalance, Krea 2 Image Edit Rebalance Steering, Krea 2 Encode Rebalance, Conditioning Ideogram4 Rebalance, Ideogram 4 Image Edit Rebalance, Ideogram 4 Encode Rebalance"""
+version = "2.4.0"
+license = { file = "LICENSE" }
 
 
 [project.urls]

@@ -1,5 +1,5 @@
 """
-    Foundational utility nodes for the OmniNode custom node pack.
+    Foundational utility nodes for Rebalance-Pack.
 
     LoadImages - Load a range of images from a directory (with sibling
         .txt captions and alpha masks).

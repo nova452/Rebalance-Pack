@@ -327,6 +327,20 @@ class LoadImagesBlaze:
 
     @classmethod
     def IS_CHANGED(cls, directory_path, **kwargs):
+        # When directory_path comes from a connector (link input), ComfyUI
+        # intentionally passes None here — IS_CHANGED never resolves links.
+        # Returning float("NaN") in that case poisons the cache signature:
+        # NaN never compares equal to itself, so the node is treated as
+        # changed on EVERY run and re-executes (re-reading and re-encoding
+        # all images). Return a stable sentinel instead; the node's cache
+        # signature still includes the upstream graph, so a genuine change
+        # of the connected path still triggers a re-run. Only the
+        # directory-content hash (files added/removed/modified) is not
+        # detected while the path is connected — requeue or use a widget
+        # path to pick those up.
+        if directory_path is None:
+            return 0
+
         directory_path = _resolve_directory_path(directory_path)
         if not directory_path or not os.path.isdir(directory_path):
             return float("NaN")
