@@ -1,6 +1,6 @@
 [project]
 name = "ComfyUI-Conditioning-Rebalance"
-description = """A set of evolving nodes that balance ComfyUI for the best user experience.
+description = """A set of evolving nodes that streamline the best use practices in ComfyUI.
 
 foundational: Input, Any, Switch, Load Images, Load Images (Blaze), Load Image Newest, Load Image Full, Save Images, Color Image, Concatenate, String (Inline), String (Inline 5), String to List, List String Index, List Display, Float Exact, Float 1.00, Float 10.00
 
