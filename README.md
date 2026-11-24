@@ -1,7 +1,7 @@
 # 24/11 Latest Update
 * New sampling nodes
 * Block-weighted LoRA loaders for MOSS-Image and MiniMax H3 / H3 Image
-* Omni Node moved to another repository.
+* Omni Node moved to another repository. [OmniNode](https://github.com/nova452/OmniNode)
 
 # 10/08
 * New core utility nodes
