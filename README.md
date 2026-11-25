@@ -4,6 +4,7 @@
 * Omni Node moved to another repository. [OmniNode](https://github.com/nova452/OmniNode)
 * New sampler solution for Moss Image's blur issue:
 <img width="2060" height="1096" alt="moss_rebalance_comparison" src="https://github.com/user-attachments/assets/7fadb9aa-39ee-4d3f-b7e2-825b233fec67" />
+
 [workflow.json](https://github.com/nova452/Rebalance-Pack/blob/main/workflows/moss_image_rebalance_sigmas.json)
 
 # 10/08
